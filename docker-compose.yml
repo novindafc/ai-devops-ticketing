@@ -1,0 +1,102 @@
+version: "3.9"
+
+services:
+
+  # ── PostgreSQL ─────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: devops
+      POSTGRES_PASSWORD: devops
+      POSTGRES_DB: devops_ticketing
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./database/seed.sql:/docker-entrypoint-initdb.d/seed.sql
+    ports: ["5432:5432"]
+    healthcheck:
+      test: ["CMD-SHELL","pg_isready -U devops"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── Redis ──────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports: ["6379:6379"]
+    healthcheck:
+      test: ["CMD","redis-cli","ping"]
+      interval: 10s
+      timeout: 5s
+
+  # ── FastAPI Backend ────────────────────────────────────────────
+  backend:
+    build: ./backend
+    restart: unless-stopped
+    env_file: ./backend/.env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://devops:devops@postgres:5432/devops_ticketing
+      REDIS_URL: redis://redis:6379/0
+      K8S_DEPLOYMENT_API_URL: http://k8s-mock:9090
+      ALLOWED_ORIGINS: '["http://localhost:3000","http://frontend:3000"]'
+    ports: ["8000:8000"]
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis:    { condition: service_healthy }
+    volumes:
+      - ./backend:/app
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+  # ── React Frontend ─────────────────────────────────────────────
+  frontend:
+    build: ./frontend
+    restart: unless-stopped
+    environment:
+      VITE_API_URL: http://localhost:8000
+    ports: ["3000:3000"]
+    depends_on: [backend]
+    volumes:
+      - ./frontend/src:/app/src
+
+  # ── n8n Workflow Engine ────────────────────────────────────────
+  n8n:
+    image: n8nio/n8n:latest
+    restart: unless-stopped
+    environment:
+      DB_TYPE: postgresdb
+      DB_POSTGRESDB_HOST: postgres
+      DB_POSTGRESDB_PORT: 5432
+      DB_POSTGRESDB_DATABASE: n8n
+      DB_POSTGRESDB_USER: devops
+      DB_POSTGRESDB_PASSWORD: devops
+      N8N_BASIC_AUTH_ACTIVE: "true"
+      N8N_BASIC_AUTH_USER: ${N8N_USER:-admin}
+      N8N_BASIC_AUTH_PASSWORD: ${N8N_PASSWORD:-admin123}
+      N8N_HOST: localhost
+      N8N_PORT: 5678
+      N8N_PROTOCOL: http
+      WEBHOOK_URL: http://localhost:5678
+      # ── n8n env vars used in workflow nodes ──────────────────
+      INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN}
+      JIRA_BASE_URL: ${JIRA_BASE_URL}
+      JIRA_PROJECT_KEY: ${JIRA_PROJECT_KEY:-DEVOPS}
+      GITHUB_WEBHOOK_SECRET: ${GITHUB_WEBHOOK_SECRET}
+    ports: ["5678:5678"]
+    depends_on:
+      postgres: { condition: service_healthy }
+    volumes:
+      - n8n_data:/home/node/.n8n
+      - ./n8n:/home/node/.n8n/workflows:ro
+
+  # ── K8s Mock API (local dev only) ─────────────────────────────
+  k8s-mock:
+    image: node:20-alpine
+    working_dir: /app
+    command: node server.js
+    volumes: ["./k8s-mock:/app"]
+    ports: ["9090:9090"]
+
+volumes:
+  postgres_data:
+  n8n_data:

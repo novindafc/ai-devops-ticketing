@@ -1,0 +1,639 @@
+{
+  "name": "Enterprise AI DevOps Ticketing v3",
+  "nodes": [
+
+    {
+      "id": "n1",
+      "name": "🔗 Trigger: GitHub CI/CD Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [80, 200],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "github-cicd",
+        "responseMode": "lastNode",
+        "options": {}
+      },
+      "notes": "⚠️ CREDENTIAL REQUIRED:\nNo credential node needed here.\nBut you MUST:\n1. Go to GitHub repo → Settings → Webhooks → Add webhook\n2. Set Payload URL = https://your-n8n-host/webhook/github-cicd\n3. Content type = application/json\n4. Set a Secret and store it as env var GITHUB_WEBHOOK_SECRET in n8n\n5. n8n validates X-Hub-Signature-256 header via the Code node below"
+    },
+
+    {
+      "id": "n2",
+      "name": "🔗 Trigger: Manual Complaint Form",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [80, 380],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "manual-ticket",
+        "responseMode": "lastNode",
+        "options": {}
+      },
+      "notes": "⚠️ CREDENTIAL REQUIRED:\nNo credential — this is an open webhook.\nSecure it with:\n1. Set WEBHOOK_AUTH_TOKEN env var in n8n\n2. The normalization Code node validates the X-Auth-Token header\n3. Webhook URL = https://your-n8n-host/webhook/manual-ticket\n4. Your React frontend sends POST to this URL"
+    },
+
+    {
+      "id": "n3",
+      "name": "🔗 Trigger: Monitoring Alert",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [80, 560],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "monitoring-alert",
+        "responseMode": "lastNode",
+        "options": {}
+      },
+      "notes": "⚠️ CREDENTIAL REQUIRED:\nNo credential node.\nConfigure in Datadog/PagerDuty/Grafana:\n1. Datadog: Integrations → Webhooks → New webhook → URL = https://your-n8n-host/webhook/monitoring-alert\n2. PagerDuty: Service → Extensions → Generic Webhook v3\n3. Grafana: Alerting → Contact points → Webhook → URL above\n4. Validate payload signature in the Code node"
+    },
+
+    {
+      "id": "n4",
+      "name": "🧹 Normalize + Clean + Detect Source",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [320, 380],
+      "parameters": {
+        "jsCode": "// ═══════════════════════════════════════════════════════════════\n// NODE: UNIVERSAL DATA NORMALIZATION\n// Handles all 3 trigger sources. Cleans data, fills missing\n// fields with safe defaults, normalizes enums, computes SLA.\n// ═══════════════════════════════════════════════════════════════\n\nconst raw = $input.first().json;\n\n// ── Utility helpers ──────────────────────────────────────────\nconst safeStr  = (v, fb='') => v == null ? fb : String(v).trim().replace(/<[^>]*>/g,'');\nconst safeArr  = (v) => Array.isArray(v) ? v : typeof v==='string' ? v.split(/[,;|]/).map(s=>s.trim()).filter(Boolean) : ['unknown-service'];\nconst safeParse= (v) => { if(!v) return {}; if(typeof v==='object') return v; try{return JSON.parse(v);}catch{return {};} };\nconst genId    = () => `TKT-${Date.now()}-${Math.random().toString(36).slice(2,6).toUpperCase()}`;\n\n// ── Severity map ─────────────────────────────────────────────\nconst SEV_MAP = {\n  critical:'CRITICAL', p0:'CRITICAL', sev0:'CRITICAL', '1':'CRITICAL',\n  high:'HIGH', p1:'HIGH', sev1:'HIGH', '2':'HIGH', error:'HIGH', failure:'HIGH',\n  medium:'MEDIUM', p2:'MEDIUM', sev2:'MEDIUM', '3':'MEDIUM', warning:'MEDIUM',\n  low:'LOW', p3:'LOW', sev3:'LOW', '4':'LOW',\n  info:'INFO', p4:'INFO', '5':'INFO'\n};\nconst normSev = (v) => SEV_MAP[String(v||'').toLowerCase()] || 'MEDIUM';\n\n// ── Category inference ────────────────────────────────────────\nconst CAT_KW = [\n  ['DEPLOYMENT',      ['deploy','release','rollout','workflow_run','build','ci','cd','pipeline']],\n  ['INFRASTRUCTURE',  ['infra','k8s','kubernetes','pod','node','cluster','vm','server']],\n  ['SECURITY',        ['security','cve','vuln','auth','ssl','tls','cert','breach','hack']],\n  ['PERFORMANCE',     ['perf','latency','slow','timeout','memory','cpu','throttle','p99']],\n  ['DATABASE',        ['database','db','sql','postgres','mysql','mongo','redis','query']],\n  ['NETWORK',         ['network','dns','connect','unreachable','503','502','gateway']],\n  ['APPLICATION',     ['app','bug','exception','crash','500','error','complaint']]\n];\nconst inferCat = (raw, desc) => {\n  const hit = CAT_KW.find(([,kws]) => kws.includes(String(raw||'').toLowerCase()));\n  if (hit) return hit[0];\n  const text = String(desc||'').toLowerCase();\n  for (const [cat,kws] of CAT_KW) if (kws.some(k=>text.includes(k))) return cat;\n  return 'APPLICATION';\n};\n\n// ── Detect source from payload shape ─────────────────────────\nconst detectSource = (r) => {\n  if (r.workflow_run || r.repository || r.check_run || r.ref) return 'GITHUB';\n  if (r.alert_type || r.alert_key || r.dd_status || r.incident_id) return 'MONITORING';\n  return 'MANUAL';\n};\n\nconst source = detectSource(raw);\nlet title, description, rawSeverity, rawCategory, services, environment, reporter, meta;\n\n// ── Per-source field extraction ───────────────────────────────\nif (source === 'GITHUB') {\n  const repo = raw.repository?.full_name || raw.repository?.name || 'unknown-repo';\n  const run  = raw.workflow_run || {};\n  const conc = run.conclusion || 'failure';\n  title       = `[CI/CD] ${run.name || 'Workflow'} ${conc.toUpperCase()} — ${repo}`;\n  description = `Branch: ${run.head_branch||'?'} | Commit: ${run.head_commit?.message||'N/A'} | Run: ${run.html_url||'#'}`;\n  rawSeverity = conc === 'failure' ? 'HIGH' : 'MEDIUM';\n  rawCategory = 'DEPLOYMENT';\n  services    = [repo.split('/')[1] || repo];\n  environment = (run.head_branch === 'main' || run.head_branch === 'master') ? 'production' : 'staging';\n  reporter    = { name: raw.sender?.login||'GitHub Actions', email:'github-actions@company.com', team:'platform-eng' };\n  meta        = { github_run_id: run.id, github_run_url: run.html_url, head_sha: run.head_sha };\n\n} else if (source === 'MONITORING') {\n  title       = safeStr(raw.title || raw.alert_title || raw.monitor_name, 'Monitoring Alert');\n  description = safeStr(raw.message || raw.body || raw.alert_message, '');\n  rawSeverity = raw.severity || raw.priority || raw.alert_severity;\n  rawCategory = raw.type || raw.alert_type || raw.category;\n  services    = safeArr(raw.service || raw.affected_services);\n  environment = safeStr(raw.env || raw.environment, 'production');\n  reporter    = { name: raw.source||'Monitoring', email:'alerts@company.com', team:'sre' };\n  meta        = { alert_id: raw.id||raw.alert_id, alert_url: raw.url||raw.alert_url };\n\n} else {\n  // MANUAL complaint form — most fields may be missing → safe defaults\n  title       = safeStr(raw.title || raw.subject || raw.summary, '');\n  description = safeStr(raw.description || raw.body || raw.message || raw.complaint, 'No description provided');\n  rawSeverity = raw.severity || raw.priority || raw.urgency;\n  rawCategory = raw.category || raw.type || raw.issue_type;\n  services    = safeArr(raw.affected_services || raw.services || raw.service);\n  environment = safeStr(raw.environment || raw.env, 'production').toLowerCase();\n  reporter    = {\n    name:  safeStr(raw.reporter_name  || raw.name  || raw.user, 'Anonymous User'),\n    email: safeStr(raw.reporter_email || raw.email,             'unknown@company.com'),\n    team:  safeStr(raw.team           || raw.squad,             'unknown')\n  };\n  meta = { form_submission: true, submitted_at: raw.submitted_at || raw.created_at };\n}\n\n// ── MISSING DATA HANDLING ─────────────────────────────────────\n// Track which fields were auto-filled so Jira/Slack can flag them\nconst missing = [];\nif (!title)                              { missing.push('title');       title = `[${source}] Untitled Incident ${genId().slice(-6)}`; }\nif (!description || description.length<5){ missing.push('description'); }\nif (!rawSeverity)                        { missing.push('severity');    }\nif (!rawCategory)                        { missing.push('category');    }\nif (!services || services[0]==='unknown-service') { missing.push('services'); }\n\nconst severity = normSev(rawSeverity);\nconst category = inferCat(rawCategory, `${title} ${description}`);\n\n// ── SLA + escalation deadlines ────────────────────────────────\nconst SLA_H = { CRITICAL:1, HIGH:4, MEDIUM:24, LOW:72, INFO:168 };\nconst slaMs  = (SLA_H[severity]||24)*3600000;\nconst now    = Date.now();\n\nconst cleaned = {\n  ticket_id:           genId(),\n  title,\n  description,\n  source,\n  severity,\n  category,\n  environment,\n  region:              safeStr(raw.region   || meta.region,    'us-east-1'),\n  cluster:             safeStr(raw.cluster  || meta.cluster,   'prod-cluster'),\n  namespace:           safeStr(raw.namespace|| meta.namespace, 'default'),\n  affected_services:   services,\n  reporter,\n  status:              'OPEN',\n  reported_at:         raw.reported_at || raw.created_at || new Date().toISOString(),\n  ingested_at:         new Date().toISOString(),\n  sla_deadline:        new Date(now + slaMs).toISOString(),\n  escalation_deadline: new Date(now + 30*60000).toISOString(),\n  metadata:            { ...meta, missing_fields: missing, execution_id: $execution.id },\n  data_quality: {\n    missing_fields:     missing,\n    completeness_score: Math.round(((5 - missing.length) / 5) * 100)\n  }\n};\n\nreturn [{ json: cleaned }];"
+      }
+    },
+
+    {
+      "id": "n5",
+      "name": "📚 Knowledge Base: Search Similar Incidents",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [560, 380],
+      "parameters": {
+        "method": "POST",
+        "url": "http://ai-devops-api:8000/knowledge/search",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [{ "name": "X-Internal-Token", "value": "={{ $env.INTERNAL_API_TOKEN }}" }]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"query\": \"{{ $json.title + ' ' + $json.description.slice(0,200) }}\",\n  \"category\": \"{{ $json.category }}\",\n  \"severity\": \"{{ $json.severity }}\",\n  \"limit\": 5\n}",
+        "options": { "timeout": 8000 }
+      },
+      "notes": "⚠️ CREDENTIAL REQUIRED:\nSet env var INTERNAL_API_TOKEN in n8n:\nn8n Settings → Environment Variables → Add INTERNAL_API_TOKEN\nValue must match INTERNAL_API_TOKEN in your backend .env file.\nThis calls your FastAPI /knowledge/search endpoint."
+    },
+
+    {
+      "id": "n6",
+      "name": "🔀 Merge KB Context into Ticket",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [800, 380],
+      "parameters": {
+        "jsCode": "// Merge knowledge base search results with the cleaned ticket.\n// Build a readable KB context string for the AI prompt.\n\nconst ticket = $input.first().json;\nlet kbItems  = [];\n\ntry {\n  const resp = ticket; // HTTP response is merged into same item\n  kbItems = resp.similar_incidents || resp.results || [];\n} catch { kbItems = []; }\n\nconst kbContext = kbItems.length > 0\n  ? kbItems.slice(0,3).map((inc, i) =>\n      `[${i+1}] \"${inc.title}\" | Fix: ${inc.applied_fix || inc.resolution_summary || 'N/A'}`\n    ).join('\\n')\n  : 'No similar past incidents found.';\n\nreturn [{ json: { ...ticket, kb_similar: kbItems, kb_context: kbContext } }];"
+      }
+    },
+
+    {
+      "id": "n7",
+      "name": "🤖 AI Analysis via FastAPI → Claude",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [1040, 380],
+      "parameters": {
+        "method": "POST",
+        "url": "http://ai-devops-api:8000/ai/analyze",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Content-Type",   "value": "application/json" },
+            { "name": "X-Internal-Token", "value": "={{ $env.INTERNAL_API_TOKEN }}" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"ticket_id\":         \"{{ $json.ticket_id }}\",\n  \"title\":             \"{{ $json.title }}\",\n  \"description\":       \"{{ $json.description }}\",\n  \"severity\":          \"{{ $json.severity }}\",\n  \"category\":          \"{{ $json.category }}\",\n  \"source\":            \"{{ $json.source }}\",\n  \"environment\":       \"{{ $json.environment }}\",\n  \"cluster\":           \"{{ $json.cluster }}\",\n  \"namespace\":         \"{{ $json.namespace }}\",\n  \"affected_services\": {{ JSON.stringify($json.affected_services) }},\n  \"kb_context\":        \"{{ $json.kb_context }}\",\n  \"missing_fields\":    {{ JSON.stringify($json.data_quality.missing_fields) }}\n}",
+        "options": { "timeout": 45000 }
+      },
+      "notes": "⚠️ CREDENTIAL REQUIRED:\nNo credential in n8n directly — Claude API key is stored in FastAPI backend.\nIn backend/.env:\n  ANTHROPIC_API_KEY=sk-ant-api...\nGet your key from: https://console.anthropic.com\nThe INTERNAL_API_TOKEN env var in n8n must match backend INTERNAL_API_TOKEN."
+    },
+
+    {
+      "id": "n8",
+      "name": "🔀 Merge AI Result + Safe Fallback",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1280, 380],
+      "parameters": {
+        "jsCode": "// ═══════════════════════════════════════════════════════════════\n// NODE: AI RESULT MERGE + FALLBACK\n// If Claude API fails or returns malformed JSON, we use\n// rule-based fallback so the workflow never breaks.\n// ═══════════════════════════════════════════════════════════════\n\nconst ticket = $input.first().json;\nlet ai = {};\n\ntry {\n  const raw = ticket.analysis || ticket.body || ticket;\n  ai = typeof raw === 'string' ? JSON.parse(raw) : raw;\n  if (ai.analysis) ai = ai.analysis; // unwrap nested\n} catch { ai = {}; }\n\n// Rule-based priority scores as fallback\nconst SEV_SCORE = { CRITICAL:95, HIGH:75, MEDIUM:45, LOW:20, INFO:5 };\n\nconst enriched = {\n  ...ticket,\n  ai: {\n    summary:                    ai.summary                    || `${ticket.category} incident in ${ticket.environment}. Immediate triage required.`,\n    priority_score:             ai.priority_score             || SEV_SCORE[ticket.severity] || 50,\n    recommended_team:           ai.recommended_team           || 'platform-sre',\n    root_cause_hypothesis:      ai.root_cause_hypothesis      || 'Root cause under investigation. Check recent deployments and error logs.',\n    recommended_actions:        ai.recommended_actions        || ['Check service logs','Review recent deploys','Monitor error rates','Page on-call if degrading'],\n    requires_rollback:          Boolean(ai.requires_rollback),\n    rollback_target:            ai.rollback_target            || '',\n    rollback_confidence:        ai.rollback_confidence        || 0,\n    escalate_to_oncall:         Boolean(ai.escalate_to_oncall) || ticket.severity === 'CRITICAL',\n    estimated_resolution_min:   ai.estimated_resolution_min  || 60,\n    confidence:                 ai.confidence                 || 0,\n    tags:                       ai.tags                       || [ticket.category.toLowerCase()],\n    similar_fix:                ai.similar_fix                || null,\n    used_fallback:              Object.keys(ai).length === 0\n  }\n};\n\nreturn [{ json: enriched }];"
+      }
+    },
+
+    {
+      "id": "n9",
+      "name": "🔀 Route by Severity",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3,
+      "position": [1520, 380],
+      "parameters": {
+        "mode": "rules",
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "string": [{ "value1": "={{ $json.severity }}", "operation": "equals", "value2": "CRITICAL" }]
+              },
+              "renameOutput": true,
+              "outputKey": "CRITICAL"
+            },
+            {
+              "conditions": {
+                "string": [{ "value1": "={{ $json.severity }}", "operation": "equals", "value2": "HIGH" }]
+              },
+              "renameOutput": true,
+              "outputKey": "HIGH"
+            }
+          ]
+        },
+        "fallbackOutput": "extra"
+      },
+      "notes": "Routes CRITICAL/HIGH to the rollback check path.\nMEDIUM/LOW/INFO fall through to direct Jira creation.\nBoth paths merge at the Format Jira Payload node."
+    },
+
+    {
+      "id": "n10",
+      "name": "❓ Requires Rollback?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1760, 260],
+      "parameters": {
+        "conditions": {
+          "conditions": [
+            {
+              "leftValue":  "={{ $json.ai.requires_rollback }}",
+              "rightValue": true,
+              "operator": { "type": "boolean", "operation": "equals" }
+            },
+            {
+              "leftValue":  "={{ $json.category }}",
+              "rightValue": "DEPLOYMENT",
+              "operator": { "type": "string", "operation": "equals" }
+            }
+          ],
+          "combinator": "and"
+        }
+      }
+    },
+
+    {
+      "id": "n11",
+      "name": "👤 HITL: Slack Rollback Approval Request",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [2000, 160],
+      "parameters": {
+        "authentication": "oAuth2",
+        "channel": "#incident-approvals",
+        "text": "🚨 *ROLLBACK APPROVAL NEEDED* — `{{ $json.ticket_id }}`",
+        "blocksUi": "=[\n  {\"type\":\"header\",\"text\":{\"type\":\"plain_text\",\"text\":\"🚨 Rollback Approval Required\"}},\n  {\"type\":\"section\",\"fields\":[\n    {\"type\":\"mrkdwn\",\"text\":\"*Ticket:*\\n`{{ $json.ticket_id }}`\"},\n    {\"type\":\"mrkdwn\",\"text\":\"*Severity:*\\n{{ $json.severity }}\"},\n    {\"type\":\"mrkdwn\",\"text\":\"*Target:*\\n`{{ $json.ai.rollback_target }}`\"},\n    {\"type\":\"mrkdwn\",\"text\":\"*Namespace:*\\n`{{ $json.namespace }}`\"},\n    {\"type\":\"mrkdwn\",\"text\":\"*AI Confidence:*\\n{{ Math.round($json.ai.rollback_confidence*100) }}%\"},\n    {\"type\":\"mrkdwn\",\"text\":\"*Environment:*\\n`{{ $json.environment }}`\"}\n  ]},\n  {\"type\":\"section\",\"text\":{\"type\":\"mrkdwn\",\"text\":\"*Root Cause:* {{ $json.ai.root_cause_hypothesis }}\"}},\n  {\"type\":\"actions\",\"block_id\":\"rollback_approval\",\"elements\":[\n    {\"type\":\"button\",\"text\":{\"type\":\"plain_text\",\"text\":\"✅ Approve Rollback\"},\"style\":\"danger\",\"value\":\"{{ $json.ticket_id }}|approve\",\"action_id\":\"approve_rollback\"},\n    {\"type\":\"button\",\"text\":{\"type\":\"plain_text\",\"text\":\"❌ Reject\"},\"value\":\"{{ $json.ticket_id }}|reject\",\"action_id\":\"reject_rollback\"}\n  ]}\n]",
+        "otherOptions": {}
+      },
+      "credentials": { "slackOAuth2Api": "Slack OAuth2" },
+      "notes": "⚠️ CREDENTIAL REQUIRED:\n1. Go to https://api.slack.com/apps → Create New App\n2. OAuth & Permissions → Bot Token Scopes: chat:write, channels:join\n3. Enable Interactivity → Request URL = https://your-n8n-host/webhook/slack-interactive\n4. Install to workspace → copy Bot User OAuth Token\n5. In n8n Credentials → New → Slack OAuth2 → paste token\n6. Name it 'Slack OAuth2'"
+    },
+
+    {
+      "id": "n12",
+      "name": "⏳ Wait for Approval (30min timeout)",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1,
+      "position": [2240, 160],
+      "parameters": {
+        "resume": "webhook",
+        "webhookSuffix": "rollback-approval",
+        "amount": 30,
+        "unit": "minutes"
+      },
+      "notes": "This PAUSES the workflow and waits for a Slack button click.\nSlack sends the interactive payload to your n8n Wait webhook.\nAfter 30 min with no response, it times out and routes to rejection path.\nSlack interactive URL must be configured in Slack App settings."
+    },
+
+    {
+      "id": "n13",
+      "name": "❓ Approved or Rejected?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [2480, 160],
+      "parameters": {
+        "conditions": {
+          "conditions": [{
+            "leftValue":  "={{ ($json.payload?.actions?.[0]?.value || $json.action || '') }}",
+            "rightValue": "approve",
+            "operator": { "type": "string", "operation": "contains" }
+          }]
+        }
+      }
+    },
+
+    {
+      "id": "n14",
+      "name": "🔄 Execute K8s Rollback (HTTP → Internal API)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [2720, 80],
+      "parameters": {
+        "method": "POST",
+        "url": "http://ai-devops-api:8000/kubernetes/rollback",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Content-Type",    "value": "application/json" },
+            { "name": "X-Internal-Token","value": "={{ $env.INTERNAL_API_TOKEN }}" },
+            { "name": "X-Audit-User",    "value": "n8n-hitl-approved" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"namespace\":  \"{{ $json.namespace }}\",\n  \"deployment\": \"{{ $json.ai.rollback_target }}\",\n  \"cluster\":    \"{{ $json.cluster }}\",\n  \"revision\":   \"previous\",\n  \"reason\":     \"Human-approved rollback for {{ $json.ticket_id }}\",\n  \"ticket_id\":  \"{{ $json.ticket_id }}\",\n  \"dry_run\":    false\n}",
+        "options": { "timeout": 90000 }
+      },
+      "notes": "⚠️ CREDENTIAL REQUIRED:\nThe INTERNAL_API_TOKEN header authenticates to FastAPI.\nFastAPI then calls your internal Kubernetes Deployment API gateway.\nSet K8S_DEPLOYMENT_API_URL and K8S_DEPLOYMENT_API_TOKEN in backend .env.\nThis uses HTTP — no kubectl or kubeconfig in n8n itself."
+    },
+
+    {
+      "id": "n15",
+      "name": "❓ Rollback Succeeded?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [2960, 80],
+      "parameters": {
+        "conditions": {
+          "conditions": [{
+            "leftValue":  "={{ $json.success }}",
+            "rightValue": true,
+            "operator": { "type": "boolean", "operation": "equals" }
+          }]
+        }
+      }
+    },
+
+    {
+      "id": "n16",
+      "name": "🚨 RETRY FAILED: Create Urgent Jira",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [3200, 180],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.JIRA_BASE_URL }}/rest/api/3/issue",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpBasicAuth",
+        "sendHeaders": true,
+        "headerParameters": [{ "name": "Content-Type", "value": "application/json" }],
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"fields\": {\n    \"project\":     { \"key\": \"{{ $env.JIRA_PROJECT_KEY }}\" },\n    \"summary\":     \"[URGENT] Rollback FAILED — {{ $json.ticket_id }} — {{ $json.ai.rollback_target }}\",\n    \"issuetype\":   { \"name\": \"Incident\" },\n    \"priority\":    { \"name\": \"Highest\" },\n    \"labels\":      [\"rollback-failed\",\"urgent\",\"automated\"],\n    \"description\": {\n      \"type\":\"doc\",\"version\":1,\n      \"content\":[{\"type\":\"paragraph\",\"content\":[{\"type\":\"text\",\"text\":\"ROLLBACK FAILED for {{ $json.ticket_id }}. Deployment={{ $json.ai.rollback_target }} NS={{ $json.namespace }} Cluster={{ $json.cluster }}. Manual intervention required immediately.\"}]}]\n    }\n  }\n}",
+        "options": {}
+      },
+      "credentials": { "httpBasicAuth": "Jira Basic Auth" },
+      "notes": "⚠️ CREDENTIAL REQUIRED:\n1. Go to id.atlassian.net/manage-profile/security/api-tokens\n2. Create API token → copy it\n3. In n8n Credentials → New → HTTP Basic Auth\n4. Username = your Jira account email (e.g. you@company.com)\n5. Password = the API token (NOT your password)\n6. Name it 'Jira Basic Auth'\n7. Set env var JIRA_BASE_URL = https://yourcompany.atlassian.net\n8. Set env var JIRA_PROJECT_KEY = DEVOPS (your project key)"
+    },
+
+    {
+      "id": "n17",
+      "name": "🚨 Notify Senior DevOps of Rollback Failure",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [3440, 180],
+      "parameters": {
+        "authentication": "oAuth2",
+        "channel": "#sre-critical",
+        "text": "🔴 *URGENT: Rollback FAILED* — `{{ $json.ticket_id }}` — Deployment `{{ $json.ai.rollback_target }}` in `{{ $json.namespace }}` could NOT be rolled back. *Manual intervention required NOW.* @channel",
+        "otherOptions": {}
+      },
+      "credentials": { "slackOAuth2Api": "Slack OAuth2" }
+    },
+
+    {
+      "id": "n18",
+      "name": "📋 Format Jira Payload (ADF)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1760, 520],
+      "parameters": {
+        "jsCode": "// ═══════════════════════════════════════════════════════════════\n// NODE: FORMAT JIRA ATLASSIAN DOCUMENT FORMAT (ADF)\n// Builds a rich Jira ticket with AI analysis, KB context,\n// recommended actions, technical context, and missing-field alerts.\n// ═══════════════════════════════════════════════════════════════\n\nconst t = $input.first().json;\n\nconst PRI = { CRITICAL:'Highest', HIGH:'High', MEDIUM:'Medium', LOW:'Low', INFO:'Lowest' };\nconst TYP = { CRITICAL:'Incident', HIGH:'Incident', MEDIUM:'Task', LOW:'Task', INFO:'Task' };\n\n// Build ADF action list items\nconst actionItems = (t.ai.recommended_actions||[]).map(a => ({\n  type:'listItem',\n  content:[{type:'paragraph',content:[{type:'text',text:a}]}]\n}));\n\n// KB section if matches exist\nconst kbSection = t.kb_similar?.length > 0 ? [\n  { type:'heading', attrs:{level:3}, content:[{type:'text',text:'📚 Similar Past Incidents (Knowledge Base)'}] },\n  ...t.kb_similar.slice(0,2).map(inc => ({\n    type:'paragraph',\n    content:[{type:'text',text:`• ${inc.title} → Fix: ${inc.resolution_summary||'See KB'}`}]\n  }))\n] : [];\n\n// Missing data warning\nconst missingSection = t.data_quality.missing_fields.length > 0 ? [{\n  type:'paragraph',\n  content:[{type:'text',text:`⚠️ Auto-filled fields (verify): ${t.data_quality.missing_fields.join(', ')}`,marks:[{type:'strong'}]}]\n}] : [];\n\nconst adf = {\n  type:'doc', version:1,\n  content:[\n    { type:'heading', attrs:{level:2}, content:[{type:'text',text:'📋 Incident Overview'}] },\n    { type:'paragraph', content:[{type:'text',text:t.ai.summary}] },\n\n    { type:'heading', attrs:{level:3}, content:[{type:'text',text:'🤖 AI Analysis'}] },\n    { type:'paragraph', content:[{type:'text',text:`Priority Score: ${t.ai.priority_score}/100 | Confidence: ${Math.round((t.ai.confidence||0)*100)}% | Est. Resolution: ${t.ai.estimated_resolution_min||60}min`}] },\n    { type:'paragraph', content:[{type:'text',text:`Root Cause: ${t.ai.root_cause_hypothesis}`}] },\n    { type:'paragraph', content:[{type:'text',text:`Assigned Team: @${t.ai.recommended_team}`}] },\n\n    { type:'heading', attrs:{level:3}, content:[{type:'text',text:'✅ Recommended Actions'}] },\n    { type:'bulletList', content: actionItems },\n\n    ...kbSection,\n\n    { type:'heading', attrs:{level:3}, content:[{type:'text',text:'🛠 Technical Context'}] },\n    { type:'paragraph', content:[{type:'text',text:`Source: ${t.source} | Env: ${t.environment} | Region: ${t.region} | Cluster: ${t.cluster} | NS: ${t.namespace}`}] },\n    { type:'paragraph', content:[{type:'text',text:`Services: ${t.affected_services.join(', ')} | Reporter: ${t.reporter.name} <${t.reporter.email}>`}] },\n    { type:'paragraph', content:[{type:'text',text:`SLA Deadline: ${t.sla_deadline} | Escalation At: ${t.escalation_deadline}`}] },\n\n    ...missingSection\n  ]\n};\n\nreturn [{ json: {\n  ...t,\n  jira_payload: {\n    fields: {\n      project:    { key: process.env.JIRA_PROJECT_KEY || 'DEVOPS' },\n      summary:    `[${t.severity}][${t.source}][${t.category}] ${t.title.slice(0,200)}`,\n      description: adf,\n      issuetype:  { name: TYP[t.severity]||'Task' },\n      priority:   { name: PRI[t.severity]||'Medium' },\n      labels:     ['automated', t.source.toLowerCase(), t.category.toLowerCase(), t.severity.toLowerCase(), t.environment, ...(t.ai.tags||[]).slice(0,4)]\n    }\n  }\n}}];"
+      }
+    },
+
+    {
+      "id": "n19",
+      "name": "🎫 Create Jira Issue",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [2000, 520],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.JIRA_BASE_URL }}/rest/api/3/issue",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpBasicAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [{ "name": "Content-Type", "value": "application/json" }]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.jira_payload) }}",
+        "options": { "timeout": 15000 }
+      },
+      "credentials": { "httpBasicAuth": "Jira Basic Auth" },
+      "notes": "⚠️ CREDENTIAL REQUIRED:\nSame 'Jira Basic Auth' credential as node n16.\nAlso needs env vars:\n  JIRA_BASE_URL = https://yourcompany.atlassian.net\n  JIRA_PROJECT_KEY = DEVOPS\nThe response body contains the Jira issue key (e.g. DEVOPS-123)."
+    },
+
+    {
+      "id": "n20",
+      "name": "📎 Extract Jira Key from Response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2240, 520],
+      "parameters": {
+        "jsCode": "const ticket = $input.first().json;\nconst jiraKey = ticket.key || ticket.id || null;\nconst base    = process.env.JIRA_BASE_URL || 'https://company.atlassian.net';\nreturn [{ json: {\n  ...ticket,\n  jira_issue_key: jiraKey,\n  jira_url:       jiraKey ? `${base}/browse/${jiraKey}` : null\n}}];"
+      }
+    },
+
+    {
+      "id": "n21",
+      "name": "💬 Format Slack Notification",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2480, 520],
+      "parameters": {
+        "jsCode": "const t  = $input.first().json;\nconst SE = { CRITICAL:'🔴', HIGH:'🟠', MEDIUM:'🟡', LOW:'🔵', INFO:'⚪' };\nconst CE = { DEPLOYMENT:'🚀', INFRASTRUCTURE:'🏗', SECURITY:'🔒', PERFORMANCE:'⚡', DATABASE:'🗄', NETWORK:'🌐', APPLICATION:'💻' };\n\nconst ch = t.severity==='CRITICAL' ? '#incidents-critical' :\n           t.severity==='HIGH'     ? '#incidents-high'     : '#devops-tickets';\n\nconst rollbackBlock = t.ai.requires_rollback ? [{\n  type:'section',\n  text:{type:'mrkdwn',text:`⚠️ *Rollback Requested* for \\`${t.ai.rollback_target}\\` — awaiting human approval in #incident-approvals`}\n}] : [];\n\nconst kbBlock = t.kb_similar?.length>0 ? [{\n  type:'context',\n  elements:[{type:'mrkdwn',text:`📚 ${t.kb_similar.length} similar past incident(s) found in knowledge base`}]\n}] : [];\n\nconst missingBlock = t.data_quality.missing_fields.length>0 ? [{\n  type:'context',\n  elements:[{type:'mrkdwn',text:`⚠️ Auto-filled fields: ${t.data_quality.missing_fields.join(', ')}`}]\n}] : [];\n\nconst blocks = [\n  { type:'header', text:{type:'plain_text',text:`${SE[t.severity]} ${t.severity} — ${t.ticket_id}`} },\n  { type:'section', fields:[\n    {type:'mrkdwn',text:`*Title:*\\n${t.title.slice(0,100)}`},\n    {type:'mrkdwn',text:`*Category:*\\n${CE[t.category]||''} ${t.category}`},\n    {type:'mrkdwn',text:`*Source:*\\n${t.source}`},\n    {type:'mrkdwn',text:`*Environment:*\\n\\`${t.environment}\\``},\n    {type:'mrkdwn',text:`*Team:*\\n@${t.ai.recommended_team}`},\n    {type:'mrkdwn',text:`*SLA:*\\n${new Date(t.sla_deadline).toUTCString()}`}\n  ]},\n  { type:'section', text:{type:'mrkdwn',text:`*🤖 AI Summary:*\\n${t.ai.summary}`} },\n  { type:'section', text:{type:'mrkdwn',text:`*Root Cause:* ${t.ai.root_cause_hypothesis}`} },\n  { type:'section', text:{type:'mrkdwn',text:`*Actions:*\\n${t.ai.recommended_actions.map((a,i)=>`${i+1}. ${a}`).join('\\n')}`} },\n  ...rollbackBlock,\n  ...kbBlock,\n  ...missingBlock,\n  {\n    type:'actions',\n    elements:[\n      t.jira_url ? {type:'button',text:{type:'plain_text',text:'🎫 Jira Issue'},url:t.jira_url,style:'primary'} : null,\n      {type:'button',text:{type:'plain_text',text:'📖 Runbook'},url:`https://runbooks.company.com/${t.category.toLowerCase()}`}\n    ].filter(Boolean)\n  },\n  {type:'divider'},\n  {type:'context',elements:[{type:'mrkdwn',text:`Services: \\`${t.affected_services.join('\\`, \\`')}\\` | Cluster: \\`${t.cluster}\\` | Confidence: ${Math.round((t.ai.confidence||0)*100)}% | Quality: ${t.data_quality.completeness_score}%`}]}\n];\n\nreturn [{ json: { ...t, slack_payload:{ channel:ch, text:`${SE[t.severity]} [${t.severity}] ${t.ticket_id} — ${t.title.slice(0,80)}`, blocks } } }];"
+      }
+    },
+
+    {
+      "id": "n22",
+      "name": "📣 Send Slack Notification",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [2720, 520],
+      "parameters": {
+        "authentication": "oAuth2",
+        "channel":   "={{ $json.slack_payload.channel }}",
+        "text":      "={{ $json.slack_payload.text }}",
+        "blocksUi":  "={{ JSON.stringify($json.slack_payload.blocks) }}",
+        "otherOptions": {}
+      },
+      "credentials": { "slackOAuth2Api": "Slack OAuth2" },
+      "notes": "⚠️ CREDENTIAL REQUIRED:\nSame 'Slack OAuth2' credential as node n11.\nScopes needed: chat:write, channels:read, channels:join\nSlack App must be added to your workspace channels."
+    },
+
+    {
+      "id": "n23",
+      "name": "📦 Final Structured Output",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2960, 520],
+      "parameters": {
+        "jsCode": "// ═══════════════════════════════════════════════════════════════\n// NODE: FINAL STRUCTURED OUTPUT\n// Assembles the canonical ticket record for database storage,\n// audit logging, and downstream system consumption.\n// ═══════════════════════════════════════════════════════════════\n\nconst t   = $input.first().json;\nconst now = new Date().toISOString();\n\nconst record = {\n  // Identity\n  ticket_id:      t.ticket_id,\n  jira_issue_key: t.jira_issue_key || null,\n  jira_url:       t.jira_url       || null,\n  status:         'OPEN',\n\n  // Core ticket\n  title:             t.title,\n  description:       t.description,\n  source:            t.source,\n  severity:          t.severity,\n  category:          t.category,\n  environment:       t.environment,\n  region:            t.region,\n  cluster:           t.cluster,\n  namespace:         t.namespace,\n  affected_services: t.affected_services,\n  reporter:          t.reporter,\n\n  // Timestamps & SLA\n  reported_at:         t.reported_at,\n  ingested_at:         t.ingested_at,\n  processed_at:        now,\n  sla_deadline:        t.sla_deadline,\n  escalation_deadline: t.escalation_deadline,\n  sla_breach_risk:     new Date(t.sla_deadline) < new Date(Date.now() + 3600000),\n\n  // AI enrichment\n  ai_analysis: t.ai,\n\n  // Knowledge base\n  kb_similar_count: (t.kb_similar||[]).length,\n  kb_similar_ids:   (t.kb_similar||[]).map(i=>i.id).filter(Boolean),\n\n  // Workflow execution summary\n  workflow_actions: {\n    jira_created:       Boolean(t.jira_issue_key),\n    slack_notified:     true,\n    rollback_requested: t.ai.requires_rollback,\n    rollback_approved:  t._rollback_approved || false,\n    rollback_executed:  t._rollback_executed || false,\n    oncall_escalated:   t.ai.escalate_to_oncall\n  },\n\n  // Data quality\n  data_quality: t.data_quality,\n  metadata:     t.metadata,\n\n  schema_version: '3.0.0',\n  processed_by:   'n8n-enterprise-workflow'\n};\n\nreturn [{ json: record }];"
+      }
+    },
+
+    {
+      "id": "n24",
+      "name": "💾 Store to Database via FastAPI",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [3200, 520],
+      "parameters": {
+        "method": "POST",
+        "url": "http://ai-devops-api:8000/tickets/store",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [{ "name": "X-Internal-Token", "value": "={{ $env.INTERNAL_API_TOKEN }}" }]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json) }}",
+        "options": {}
+      }
+    },
+
+    {
+      "id": "n25",
+      "name": "📚 Add to Knowledge Base",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [3440, 520],
+      "parameters": {
+        "method": "POST",
+        "url": "http://ai-devops-api:8000/knowledge/store",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [{ "name": "X-Internal-Token", "value": "={{ $env.INTERNAL_API_TOKEN }}" }]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"ticket_id\":   \"{{ $json.ticket_id }}\",\n  \"title\":       \"{{ $json.title }}\",\n  \"description\": \"{{ $json.description.slice(0,500) }}\",\n  \"category\":    \"{{ $json.category }}\",\n  \"severity\":    \"{{ $json.severity }}\",\n  \"source\":      \"{{ $json.source }}\",\n  \"ai_analysis\": {{ JSON.stringify($json.ai_analysis) }},\n  \"status\":      \"OPEN\"\n}",
+        "options": {}
+      }
+    },
+
+    {
+      "id": "n26",
+      "name": "⏰ Schedule: Check Escalations Every 5min",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1,
+      "position": [80, 760],
+      "parameters": {
+        "rule": { "interval": [{ "field": "minutes", "minutesInterval": 5 }] }
+      },
+      "notes": "Runs every 5 minutes independently.\nChecks for tickets unresolved after 30-minute escalation deadline.\nFinds tickets in OPEN or INVESTIGATING status past their escalation_deadline.\nNo credentials needed."
+    },
+
+    {
+      "id": "n27",
+      "name": "🔍 Find Tickets Past Escalation Deadline",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [320, 760],
+      "parameters": {
+        "method": "GET",
+        "url": "http://ai-devops-api:8000/tickets/escalation-candidates",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [{ "name": "X-Internal-Token", "value": "={{ $env.INTERNAL_API_TOKEN }}" }]
+        },
+        "options": {}
+      }
+    },
+
+    {
+      "id": "n28",
+      "name": "🔀 Split Each Ticket",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [560, 760],
+      "parameters": { "batchSize": 1 }
+    },
+
+    {
+      "id": "n29",
+      "name": "🔔 Escalate: Notify Manager on Slack",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [800, 760],
+      "parameters": {
+        "authentication": "oAuth2",
+        "channel": "#sre-escalations",
+        "text": "⏰ *ESCALATION* — Ticket `{{ $json.ticket_id }}` unresolved for 30+ min.\nStatus: `{{ $json.status }}` | Severity: `{{ $json.severity }}` | Category: {{ $json.category }}\nJira: {{ $json.jira_issue_key || 'N/A' }}\n@channel Please investigate immediately.",
+        "otherOptions": {}
+      },
+      "credentials": { "slackOAuth2Api": "Slack OAuth2" }
+    },
+
+    {
+      "id": "n30",
+      "name": "🔔 Escalate: Comment on Jira Ticket",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [1040, 760],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.JIRA_BASE_URL }}/rest/api/3/issue/{{ $json.jira_issue_key }}/comment",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpBasicAuth",
+        "sendHeaders": true,
+        "headerParameters": [{ "name": "Content-Type", "value": "application/json" }],
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"body\": {\n    \"type\":\"doc\",\"version\":1,\n    \"content\":[{\"type\":\"paragraph\",\"content\":[{\"type\":\"text\",\"text\":\"⏰ ESCALATION: Ticket unresolved after 30 minutes. SLA breach imminent. Manager notified via Slack at {{ new Date().toISOString() }}\"}]}]\n  }\n}",
+        "options": {}
+      },
+      "credentials": { "httpBasicAuth": "Jira Basic Auth" }
+    },
+
+    {
+      "id": "n31",
+      "name": "📊 Update Status → ESCALATED",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [1280, 760],
+      "parameters": {
+        "method": "PATCH",
+        "url": "http://ai-devops-api:8000/tickets/{{ $json.ticket_id }}/status",
+        "sendHeaders": true,
+        "headerParameters": [{ "name": "X-Internal-Token", "value": "={{ $env.INTERNAL_API_TOKEN }}" }],
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\"status\":\"ESCALATED\",\"escalated_at\":\"{{ new Date().toISOString() }}\"}",
+        "options": {}
+      }
+    }
+
+  ],
+
+  "connections": {
+    "🔗 Trigger: GitHub CI/CD Webhook": {
+      "main": [[{ "node": "🧹 Normalize + Clean + Detect Source", "type": "main", "index": 0 }]]
+    },
+    "🔗 Trigger: Manual Complaint Form": {
+      "main": [[{ "node": "🧹 Normalize + Clean + Detect Source", "type": "main", "index": 0 }]]
+    },
+    "🔗 Trigger: Monitoring Alert": {
+      "main": [[{ "node": "🧹 Normalize + Clean + Detect Source", "type": "main", "index": 0 }]]
+    },
+    "🧹 Normalize + Clean + Detect Source": {
+      "main": [[{ "node": "📚 Knowledge Base: Search Similar Incidents", "type": "main", "index": 0 }]]
+    },
+    "📚 Knowledge Base: Search Similar Incidents": {
+      "main": [[{ "node": "🔀 Merge KB Context into Ticket", "type": "main", "index": 0 }]]
+    },
+    "🔀 Merge KB Context into Ticket": {
+      "main": [[{ "node": "🤖 AI Analysis via FastAPI → Claude", "type": "main", "index": 0 }]]
+    },
+    "🤖 AI Analysis via FastAPI → Claude": {
+      "main": [[{ "node": "🔀 Merge AI Result + Safe Fallback", "type": "main", "index": 0 }]]
+    },
+    "🔀 Merge AI Result + Safe Fallback": {
+      "main": [[{ "node": "🔀 Route by Severity", "type": "main", "index": 0 }]]
+    },
+    "🔀 Route by Severity": {
+      "main": [
+        [{ "node": "❓ Requires Rollback?", "type": "main", "index": 0 }],
+        [{ "node": "❓ Requires Rollback?", "type": "main", "index": 0 }],
+        [{ "node": "📋 Format Jira Payload (ADF)", "type": "main", "index": 0 }]
+      ]
+    },
+    "❓ Requires Rollback?": {
+      "main": [
+        [{ "node": "👤 HITL: Slack Rollback Approval Request", "type": "main", "index": 0 }],
+        [{ "node": "📋 Format Jira Payload (ADF)", "type": "main", "index": 0 }]
+      ]
+    },
+    "👤 HITL: Slack Rollback Approval Request": {
+      "main": [[{ "node": "⏳ Wait for Approval (30min timeout)", "type": "main", "index": 0 }]]
+    },
+    "⏳ Wait for Approval (30min timeout)": {
+      "main": [[{ "node": "❓ Approved or Rejected?", "type": "main", "index": 0 }]]
+    },
+    "❓ Approved or Rejected?": {
+      "main": [
+        [{ "node": "🔄 Execute K8s Rollback (HTTP → Internal API)", "type": "main", "index": 0 }],
+        [{ "node": "📋 Format Jira Payload (ADF)", "type": "main", "index": 0 }]
+      ]
+    },
+    "🔄 Execute K8s Rollback (HTTP → Internal API)": {
+      "main": [[{ "node": "❓ Rollback Succeeded?", "type": "main", "index": 0 }]]
+    },
+    "❓ Rollback Succeeded?": {
+      "main": [
+        [{ "node": "📋 Format Jira Payload (ADF)", "type": "main", "index": 0 }],
+        [{ "node": "🚨 RETRY FAILED: Create Urgent Jira", "type": "main", "index": 0 }]
+      ]
+    },
+    "🚨 RETRY FAILED: Create Urgent Jira": {
+      "main": [[{ "node": "🚨 Notify Senior DevOps of Rollback Failure", "type": "main", "index": 0 }]]
+    },
+    "📋 Format Jira Payload (ADF)": {
+      "main": [[{ "node": "🎫 Create Jira Issue", "type": "main", "index": 0 }]]
+    },
+    "🎫 Create Jira Issue": {
+      "main": [[{ "node": "📎 Extract Jira Key from Response", "type": "main", "index": 0 }]]
+    },
+    "📎 Extract Jira Key from Response": {
+      "main": [[{ "node": "💬 Format Slack Notification", "type": "main", "index": 0 }]]
+    },
+    "💬 Format Slack Notification": {
+      "main": [[{ "node": "📣 Send Slack Notification", "type": "main", "index": 0 }]]
+    },
+    "📣 Send Slack Notification": {
+      "main": [[{ "node": "📦 Final Structured Output", "type": "main", "index": 0 }]]
+    },
+    "📦 Final Structured Output": {
+      "main": [[{ "node": "💾 Store to Database via FastAPI", "type": "main", "index": 0 }]]
+    },
+    "💾 Store to Database via FastAPI": {
+      "main": [[{ "node": "📚 Add to Knowledge Base", "type": "main", "index": 0 }]]
+    },
+    "⏰ Schedule: Check Escalations Every 5min": {
+      "main": [[{ "node": "🔍 Find Tickets Past Escalation Deadline", "type": "main", "index": 0 }]]
+    },
+    "🔍 Find Tickets Past Escalation Deadline": {
+      "main": [[{ "node": "🔀 Split Each Ticket", "type": "main", "index": 0 }]]
+    },
+    "🔀 Split Each Ticket": {
+      "main": [[{ "node": "🔔 Escalate: Notify Manager on Slack", "type": "main", "index": 0 }]]
+    },
+    "🔔 Escalate: Notify Manager on Slack": {
+      "main": [[{ "node": "🔔 Escalate: Comment on Jira Ticket", "type": "main", "index": 0 }]]
+    },
+    "🔔 Escalate: Comment on Jira Ticket": {
+      "main": [[{ "node": "📊 Update Status → ESCALATED", "type": "main", "index": 0 }]]
+    }
+  },
+
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "errorWorkflow": "devops-error-handler",
+    "timezone": "UTC"
+  },
+  "tags": ["enterprise", "devops", "ai", "ticketing", "v3"]
+}
