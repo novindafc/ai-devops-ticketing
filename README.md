@@ -1,7 +1,5 @@
 # AI-Powered Enterprise DevOps Ticketing Platform
 
-## README.md
-
 ## Overview
 
 This project is an enterprise-style incident management platform that combines AI analysis, DevOps automation, and multi-source ticket ingestion.
